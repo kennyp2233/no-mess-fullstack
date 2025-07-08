@@ -12,13 +12,18 @@ export interface FileUploadResult {
   url: string;
 }
 
+export interface TransactionFileUploadResult extends FileUploadResult {
+  transactionId?: string;
+}
+
 @Injectable()
 export class FileStorageService {
   
   /**
    * Process uploaded file and return file information
+   * Enhanced for transaction file handling
    */
-  async uploadFile(file: Express.Multer.File): Promise<FileUploadResult> {
+  async uploadFile(file: Express.Multer.File, context?: { transactionId?: string }): Promise<TransactionFileUploadResult> {
     if (!file) {
       throw new BadRequestException('No file provided');
     }
@@ -47,6 +52,7 @@ export class FileStorageService {
       uploadedAt: new Date(),
       filePath: cleanPath,
       url: `/files/${cleanPath}`,
+      transactionId: context?.transactionId,
     };
   }
 
@@ -132,5 +138,30 @@ export class FileStorageService {
     } catch (error) {
       return { exists: false };
     }
+  }
+
+  /**
+   * Upload file specifically for a transaction
+   */
+  async uploadTransactionFile(file: Express.Multer.File, transactionId: string): Promise<TransactionFileUploadResult> {
+    return this.uploadFile(file, { transactionId });
+  }
+
+  /**
+   * Validate that a file path belongs to a transaction
+   */
+  async validateTransactionFile(filePath: string, transactionId: string): Promise<boolean> {
+    // This could be enhanced to check database records
+    // For now, we just check if the file exists
+    const fileInfo = await this.getFileInfo(filePath);
+    return fileInfo.exists;
+  }
+
+  /**
+   * Get file download URL for transaction
+   */
+  getTransactionFileUrl(filePath: string): string {
+    const cleanPath = filePath.startsWith('/') ? filePath.substring(1) : filePath;
+    return `/files/${cleanPath}`;
   }
 }

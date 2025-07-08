@@ -1,4 +1,4 @@
-import { IsString, IsOptional, MinLength, MaxLength, IsNotEmpty } from 'class-validator';
+import { IsString, IsOptional, MinLength, MaxLength, IsNotEmpty, IsNumber, Min } from 'class-validator';
 
 export class CreateHouseDto {
   @IsNotEmpty()
@@ -11,4 +11,13 @@ export class CreateHouseDto {
   @IsString()
   @MaxLength(500, { message: 'Description must not exceed 500 characters' })
   description?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200, { message: 'Address must not exceed 200 characters' })
+  address?: string;
+
+  @IsOptional()
+  @IsNumber({}, { message: 'Balance must be a valid number' })
+  balance?: number;
 }

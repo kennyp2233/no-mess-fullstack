@@ -1,7 +1,7 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../../shared/database';
-import { CreateHouseDto, UpdateHouseDto, QueryHousesDto, PaginatedResponseDto } from '../dto';
-import { House } from '@prisma/client';
+import { CreateHouseDto, UpdateHouseDto, QueryHousesDto, PaginatedResponseDto, AssignUserToHouseDto } from '../dto';
+import { House, Role } from '@prisma/client';
 
 @Injectable()
 export class HousesService {
@@ -9,7 +9,10 @@ export class HousesService {
 
   async create(createHouseDto: CreateHouseDto) {
     const house = await this.prismaService.house.create({
-      data: createHouseDto,
+      data: {
+        ...createHouseDto,
+        balance: createHouseDto.balance || 0,
+      },
       include: {
         users: {
           include: {
@@ -18,13 +21,16 @@ export class HousesService {
                 id: true,
                 email: true,
                 name: true,
+                phone: true,
               },
             },
           },
         },
         _count: {
           select: {
-            receipts: true,
+            transactions: true,
+            projects: true,
+            assemblies: true,
           },
         },
       },
@@ -77,13 +83,16 @@ export class HousesService {
                 id: true,
                 email: true,
                 name: true,
+                phone: true,
               },
             },
           },
         },
         _count: {
           select: {
-            receipts: true,
+            transactions: true,
+            projects: true,
+            assemblies: true,
           },
         },
       },
@@ -103,11 +112,12 @@ export class HousesService {
                 id: true,
                 email: true,
                 name: true,
+                phone: true,
               },
             },
           },
         },
-        receipts: {
+        transactions: {
           include: {
             user: {
               select: {
@@ -118,6 +128,18 @@ export class HousesService {
             },
           },
           orderBy: { createdAt: 'desc' },
+          take: 10, // Últimas 10 transacciones
+        },
+        projects: {
+          orderBy: { createdAt: 'desc' },
+          take: 5, // Últimos 5 proyectos
+        },
+        _count: {
+          select: {
+            transactions: true,
+            projects: true,
+            assemblies: true,
+          },
         },
       },
     });
@@ -152,13 +174,16 @@ export class HousesService {
                 id: true,
                 email: true,
                 name: true,
+                phone: true,
               },
             },
           },
         },
         _count: {
           select: {
-            receipts: true,
+            transactions: true,
+            projects: true,
+            assemblies: true,
           },
         },
       },
@@ -176,5 +201,178 @@ export class HousesService {
     });
 
     return { message: `House "${deletedHouse.name}" has been deleted successfully` };
+  }
+
+  // New methods for the updated schema
+
+  async getHouseBalance(id: string): Promise<{ balance: number; houseId: string; houseName: string }> {
+    const house = await this.prismaService.house.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        name: true,
+        balance: true,
+      },
+    });
+
+    if (!house) {
+      throw new NotFoundException(`House with ID ${id} not found`);
+    }
+
+    return {
+      balance: house.balance,
+      houseId: house.id,
+      houseName: house.name,
+    };
+  }
+
+  async assignUserToHouse(houseId: string, assignUserDto: AssignUserToHouseDto): Promise<any> {
+    // Verify house exists
+    const house = await this.prismaService.house.findUnique({
+      where: { id: houseId },
+    });
+
+    if (!house) {
+      throw new NotFoundException(`House with ID ${houseId} not found`);
+    }
+
+    // Verify user exists
+    const user = await this.prismaService.user.findUnique({
+      where: { id: assignUserDto.userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException(`User with ID ${assignUserDto.userId} not found`);
+    }
+
+    // Check if relationship already exists
+    const existingRelation = await this.prismaService.houseUser.findUnique({
+      where: {
+        userId_houseId: {
+          userId: assignUserDto.userId,
+          houseId: houseId,
+        },
+      },
+    });
+
+    if (existingRelation) {
+      throw new ConflictException('User is already assigned to this house');
+    }
+
+    // Create the relationship
+    const houseUser = await this.prismaService.houseUser.create({
+      data: {
+        userId: assignUserDto.userId,
+        houseId: houseId,
+        role: assignUserDto.role,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            phone: true,
+          },
+        },
+        house: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    return houseUser;
+  }
+
+  async removeUserFromHouse(houseId: string, userId: string): Promise<{ message: string }> {
+    // Verify the relationship exists
+    const houseUser = await this.prismaService.houseUser.findUnique({
+      where: {
+        userId_houseId: {
+          userId: userId,
+          houseId: houseId,
+        },
+      },
+      include: {
+        user: {
+          select: {
+            name: true,
+          },
+        },
+        house: {
+          select: {
+            name: true,
+          },
+        },
+      },
+    });
+
+    if (!houseUser) {
+      throw new NotFoundException('User is not assigned to this house');
+    }
+
+    // Delete the relationship
+    await this.prismaService.houseUser.delete({
+      where: {
+        userId_houseId: {
+          userId: userId,
+          houseId: houseId,
+        },
+      },
+    });
+
+    return {
+      message: `User "${houseUser.user.name}" has been removed from house "${houseUser.house.name}"`,
+    };
+  }
+
+  async updateUserRole(houseId: string, userId: string, newRole: Role): Promise<any> {
+    // Verify the relationship exists
+    const houseUser = await this.prismaService.houseUser.findUnique({
+      where: {
+        userId_houseId: {
+          userId: userId,
+          houseId: houseId,
+        },
+      },
+    });
+
+    if (!houseUser) {
+      throw new NotFoundException('User is not assigned to this house');
+    }
+
+    // Update the role
+    const updatedHouseUser = await this.prismaService.houseUser.update({
+      where: {
+        userId_houseId: {
+          userId: userId,
+          houseId: houseId,
+        },
+      },
+      data: {
+        role: newRole,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            phone: true,
+          },
+        },
+        house: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    return updatedHouseUser;
   }
 }

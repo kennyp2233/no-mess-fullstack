@@ -27,6 +27,7 @@ export class FileStorageController {
 
   /**
    * Upload a PDF file
+   * Can be used for transaction documents, receipts, invoices, etc.
    */
   @Post('upload')
   @HttpCode(HttpStatus.CREATED)
@@ -47,7 +48,31 @@ export class FileStorageController {
   }
 
   /**
+   * Upload a file specifically for a transaction
+   */
+  @Post('upload/transaction/:transactionId')
+  @HttpCode(HttpStatus.CREATED)
+  @UseInterceptors(FileInterceptor('file'))
+  @Roles(Role.ADMIN, Role.PRESIDENT, Role.TREASURER)
+  async uploadTransactionFile(
+    @UploadedFile() file: Express.Multer.File,
+    @Param('transactionId') transactionId: string,
+    @CurrentUser() user: any
+  ) {
+    if (!file) {
+      throw new BadRequestException('No file provided');
+    }
+
+    const result = await this.fileStorageService.uploadTransactionFile(file, transactionId);
+    return {
+      message: 'Transaction file uploaded successfully',
+      file: result,
+    };
+  }
+
+  /**
    * Download a file by path
+   * Works for transaction files, receipts, and other documents
    */
   @Get(':path(*)')
   async getFile(

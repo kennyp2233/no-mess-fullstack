@@ -12,9 +12,10 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  Put,
 } from '@nestjs/common';
 import { HousesService } from '../services/houses.service';
-import { CreateHouseDto, UpdateHouseDto, QueryHousesDto } from '../dto';
+import { CreateHouseDto, UpdateHouseDto, QueryHousesDto, AssignUserToHouseDto } from '../dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../../auth/guards/roles.guard';
 import { Roles } from '../../../shared/decorators';
@@ -71,5 +72,49 @@ export class HousesController {
     @CurrentUser() user: any
   ) {
     return this.housesService.remove(id);
+  }
+
+  // New endpoints for updated schema
+
+  @Get(':id/balance')
+  @Roles(Role.ADMIN, Role.PRESIDENT, Role.TREASURER)
+  getBalance(
+    @Param('id') id: string,
+    @CurrentUser() user: any
+  ) {
+    return this.housesService.getHouseBalance(id);
+  }
+
+  @Post(':id/users')
+  @HttpCode(HttpStatus.CREATED)
+  @Roles(Role.ADMIN, Role.PRESIDENT)
+  assignUser(
+    @Param('id') houseId: string,
+    @Body(ValidationPipe) assignUserDto: AssignUserToHouseDto,
+    @CurrentUser() user: any
+  ) {
+    return this.housesService.assignUserToHouse(houseId, assignUserDto);
+  }
+
+  @Delete(':id/users/:userId')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN, Role.PRESIDENT)
+  removeUser(
+    @Param('id') houseId: string,
+    @Param('userId') userId: string,
+    @CurrentUser() user: any
+  ) {
+    return this.housesService.removeUserFromHouse(houseId, userId);
+  }
+
+  @Put(':id/users/:userId/role')
+  @Roles(Role.ADMIN, Role.PRESIDENT)
+  updateUserRole(
+    @Param('id') houseId: string,
+    @Param('userId') userId: string,
+    @Body('role') newRole: Role,
+    @CurrentUser() user: any
+  ) {
+    return this.housesService.updateUserRole(houseId, userId, newRole);
   }
 }

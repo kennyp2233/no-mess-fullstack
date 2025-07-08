@@ -15,9 +15,9 @@ export class RegisterDto {
 
   @IsOptional()
   @IsString()
-  phoneNumber?: string;
+  phone?: string;
 
   @IsEnum(Role)
   @IsOptional()
-  role?: Role = Role.MEMBER;
+  role?: Role = Role.RESIDENT; // Changed from MEMBER to RESIDENT
 }

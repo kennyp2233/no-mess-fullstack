@@ -13,30 +13,103 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Enums
+// ========================================
+// ENUMS
+// ========================================
+
 enum Role {
   ADMIN
-  MEMBER
+  PRESIDENT
+  TREASURER
+  SECRETARY
+  RESIDENT
 }
 
-enum ReceiptStatus {
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionCategory {
+  ALIQUOT
+  EXTRAORDINARY_FEE
+  FINE
+  MAINTENANCE
+  PROJECT
+  DONATION
+  OTHER
+}
+
+enum ProjectStatus {
+  PROPOSED
+  APPROVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum VotingType {
+  SIMPLE_MAJORITY
+  QUALIFIED_MAJORITY
+  UNANIMITY
+}
+
+enum AssemblyStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum VoteOption {
+  YES
+  NO
+  ABSTAIN
+}
+
+enum ProposalType {
+  PROJECT_APPROVAL
+  ALIQUOT_CHANGE
+  BUDGET_APPROVAL
+  REGULATION_CHANGE
+  EXTRAORDINARY_FEE
+  OTHER
+}
+
+enum ProposalStatus {
   PENDING
   APPROVED
   REJECTED
 }
 
-// Models
+enum MinutesStatus {
+  DRAFT
+  VALIDATED
+  PUBLISHED
+}
+
+// ========================================
+// MODELS
+// ========================================
+
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
   name      String
   password  String
+  phone     String?
+  role      Role     @default(RESIDENT)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   // Relations
-  houses   HouseUser[]
-  receipts Receipt[]
+  houses        HouseUser[]
+  transactions  Transaction[]
+  votes         Vote[]
+  proposals     Proposal[]
+  notifications Notification[]
+  minutesAsSecretary  Minutes[] @relation("MinutesSecretary")
+  minutesAsValidator  Minutes[] @relation("MinutesValidator")
 
   @@map("users")
 }
@@ -45,20 +118,26 @@ model House {
   id          String   @id @default(cuid())
   name        String
   description String?
+  address     String?
+  balance     Float    @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   // Relations
-  users    HouseUser[]
-  receipts Receipt[]
+  users        HouseUser[]
+  accounts     Account[]
+  transactions Transaction[]
+  projects     Project[]
+  assemblies   Assembly[]
+  budgets      Budget[]
 
   @@map("houses")
 }
 
 model HouseUser {
-  id     String @id @default(cuid())
-  role   Role   @default(MEMBER)
-  userId String
+  id      String @id @default(cuid())
+  role    Role   @default(RESIDENT)
+  userId  String
   houseId String
 
   // Relations
@@ -69,25 +148,206 @@ model HouseUser {
   @@map("house_users")
 }
 
-model Receipt {
-  id          String        @id @default(cuid())
+model Account {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  balance     Float    @default(0)
+  houseId     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  house        House         @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@map("accounts")
+}
+
+model Transaction {
+  id          String            @id @default(cuid())
   title       String
   description String?
   amount      Float
+  type        TransactionType
+  category    TransactionCategory
   date        DateTime
-  status      ReceiptStatus @default(PENDING)
-  imageUrl    String?
   filePath    String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  // Foreign keys
+  userId    String
+  houseId   String
+  accountId String
+  projectId String?
+
+  // Relations
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  house   House    @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  account Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@map("transactions")
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  title       String
+  description String
+  budget      Float
+  status      ProjectStatus @default(PROPOSED)
+  startDate   DateTime?
+  endDate     DateTime?
+  houseId     String
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
 
-  // Foreign keys
-  userId  String
-  houseId String
+  // Relations
+  house        House         @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  proposals    Proposal[]
+
+  @@map("projects")
+}
+
+model Assembly {
+  id          String          @id @default(cuid())
+  title       String
+  description String?
+  date        DateTime
+  location    String?
+  status      AssemblyStatus  @default(SCHEDULED)
+  houseId     String
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
 
   // Relations
-  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  house     House       @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  votings   Voting[]
+  minutes   Minutes[]
+  proposals Proposal[]
+
+  @@map("assemblies")
+}
+
+model Voting {
+  id               String      @id @default(cuid())
+  title            String
+  description      String?
+  type             VotingType
+  startDate        DateTime
+  endDate          DateTime
+  requiredQuorum   Int?
+  assemblyId       String
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  // Relations
+  assembly  Assembly   @relation(fields: [assemblyId], references: [id], onDelete: Cascade)
+  votes     Vote[]
+  proposals Proposal[] // Multiple proposals can be in one voting
+
+  @@map("votings")
+}
+
+model Vote {
+  id        String     @id @default(cuid())
+  option    VoteOption
+  comment   String?
+  userId    String
+  votingId  String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  voting Voting @relation(fields: [votingId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, votingId])
+  @@map("votes")
+}
+
+model Proposal {
+  id           String         @id @default(cuid())
+  title        String
+  description  String
+  proposalType ProposalType
+  status       ProposalStatus @default(PENDING)
+  userId       String
+  assemblyId   String?
+  votingId     String?
+  projectId    String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  // Relations
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assembly Assembly? @relation(fields: [assemblyId], references: [id], onDelete: SetNull)
+  voting   Voting?   @relation(fields: [votingId], references: [id], onDelete: SetNull)
+  project  Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@map("proposals")
+}
+
+model Minutes {
+  id            String        @id @default(cuid())
+  title         String
+  content       String        @db.Text
+  attendees     String[]      @default([])
+  decisions     String[]      @default([])
+  status        MinutesStatus @default(DRAFT)
+  assemblyId    String        @unique
+  secretaryId   String?
+  validatedBy   String?
+  validatedAt   DateTime?
+  publishedAt   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Relations
+  assembly    Assembly @relation(fields: [assemblyId], references: [id], onDelete: Cascade)
+  secretary   User?    @relation("MinutesSecretary", fields: [secretaryId], references: [id])
+  validator   User?    @relation("MinutesValidator", fields: [validatedBy], references: [id])
+
+  @@map("minutes")
+}
+
+model Budget {
+  id              String   @id @default(cuid())
+  year            Int
+  totalIncome     Float    @default(0)
+  totalExpense    Float    @default(0)
+  projectedIncome Float
+  projectedExpense Float
+  isApproved      Boolean  @default(false)
+  houseId         String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
   house House @relation(fields: [houseId], references: [id], onDelete: Cascade)
 
-  @@map("receipts")
+  @@unique([year, houseId])
+  @@map("budgets")
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  title       String
+  message     String
+  type        String    // NotificationType enum
+  priority    String    @default("MEDIUM") // NotificationPriority enum
+  isRead      Boolean   @default(false)
+  userId      String
+  entityType  String?   // Type of entity this notification relates to
+  entityId    String?   // ID of the related entity
+  metadata    Json?     // Additional data stored as JSON
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
 }
