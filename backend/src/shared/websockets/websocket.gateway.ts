@@ -8,7 +8,7 @@ import {
     MessageBody,
     ConnectedSocket,
 } from '@nestjs/websockets';
-import { Logger, UseGuards } from '@nestjs/common';
+import { Logger, UseGuards, BadRequestException } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { JwtService } from '@nestjs/jwt';
 import { WebSocketService } from './websocket.service';
@@ -16,6 +16,17 @@ import { WsAuthGuard } from './ws-auth.guard';
 import { WsCurrentUser } from './ws-current-user.decorator';
 import { WebSocketUser } from '../types/websocket.types';
 import { PrismaService } from '../database/prisma.service';
+
+// Rate limiting configuration
+interface RateLimitConfig {
+    maxRequests: number;
+    windowMs: number;
+}
+
+interface RateLimitInfo {
+    requests: number;
+    resetTime: number;
+}
 
 @WebSocketGateway({
     cors: {
@@ -31,6 +42,13 @@ export class AppWebSocketGateway
     server: Server;
 
     private readonly logger = new Logger(AppWebSocketGateway.name);
+    
+    // Rate limiting storage
+    private rateLimitMap = new Map<string, RateLimitInfo>();
+    private readonly rateLimitConfig: RateLimitConfig = {
+        maxRequests: 10, // 10 requests per window
+        windowMs: 60000, // 1 minute window
+    };
 
     constructor(
         private webSocketService: WebSocketService,
@@ -43,24 +61,92 @@ export class AppWebSocketGateway
     // ===========================================
 
     @SubscribeMessage('test_message')
-    handleTestMessage(
+    async handleTestMessage(
         @MessageBody() data: any,
         @ConnectedSocket() client: Socket,
-    ): void {
-        this.logger.log('📨 Received test message:', data);
+    ): Promise<void> {
+        try {
+            // Rate limiting check
+            if (!this.checkRateLimit(client.id)) {
+                this.logger.warn(`Rate limit exceeded for client ${client.id}`);
+                client.emit('rate_limit_error', {
+                    success: false,
+                    error: { 
+                        message: 'Rate limit exceeded. Please wait before sending more messages.',
+                        code: 'RATE_LIMIT_EXCEEDED'
+                    },
+                    timestamp: new Date().toISOString(),
+                });
+                return;
+            }
 
-        // Send response back to client
-        client.emit('message_response', {
-            success: true,
-            message: 'Test message received successfully',
-            receivedData: data,
-            timestamp: new Date().toISOString(),
-        });
+            // Validate input data
+            if (!this.validateTestMessageData(data)) {
+                this.logger.warn(`Invalid test message data from client ${client.id}:`, data);
+                client.emit('validation_error', {
+                    success: false,
+                    error: { 
+                        message: 'Invalid message format',
+                        code: 'INVALID_DATA_FORMAT'
+                    },
+                    timestamp: new Date().toISOString(),
+                });
+                return;
+            }
+
+            this.logger.log('📨 Received test message:', data);
+
+            // Send response back to client
+            client.emit('message_response', {
+                success: true,
+                message: 'Test message received successfully',
+                receivedData: data,
+                timestamp: new Date().toISOString(),
+            });
+
+        } catch (error) {
+            this.logger.error(`Error handling test message from client ${client.id}:`, error);
+            client.emit('connection_error', {
+                success: false,
+                error: { 
+                    message: 'Internal server error',
+                    code: 'INTERNAL_ERROR'
+                },
+                timestamp: new Date().toISOString(),
+            });
+        }
     }
 
+    @SubscribeMessage('pong')
+    async handlePong(
+        @ConnectedSocket() client: Socket,
+    ): Promise<void> {
+        try {
+            this.webSocketService.handlePong(client.id);
+            this.logger.debug(`Received pong from client ${client.id}`);
+        } catch (error) {
+            this.logger.error(`Error handling pong from client ${client.id}:`, error);
+        }
+    }
+
+    // ===========================================
+    // CONNECTION MANAGEMENT
+    // ===========================================
+
     afterInit(server: Server) {
-        this.webSocketService.setServer(server);
-        this.logger.log('WebSocket Gateway initialized');
+        try {
+            this.webSocketService.setServer(server);
+            this.logger.log('WebSocket Gateway initialized');
+            
+            // Start heartbeat interval
+            this.startHeartbeat();
+            
+            // Start orphaned connection cleanup
+            this.startOrphanedConnectionCleanup();
+            
+        } catch (error) {
+            this.logger.error('Error initializing WebSocket Gateway:', error);
+        }
     }
 
     async handleConnection(client: Socket) {
@@ -72,9 +158,12 @@ export class AppWebSocketGateway
 
             if (!token) {
                 this.logger.warn(`Client ${client.id} attempted to connect without token`);
-                client.emit('auth-error', {
+                client.emit('auth_error', {
                     success: false,
-                    error: { message: 'Authentication token required' },
+                    error: { 
+                        message: 'Authentication token required',
+                        code: 'AUTH_TOKEN_MISSING'
+                    },
                     timestamp: new Date().toISOString(),
                 });
                 client.disconnect();
@@ -86,9 +175,12 @@ export class AppWebSocketGateway
 
             if (!user) {
                 this.logger.warn(`Client ${client.id} provided invalid token`);
-                client.emit('auth-error', {
+                client.emit('auth_error', {
                     success: false,
-                    error: { message: 'Invalid authentication token' },
+                    error: { 
+                        message: 'Invalid authentication token',
+                        code: 'INVALID_TOKEN'
+                    },
                     timestamp: new Date().toISOString(),
                 });
                 client.disconnect();
@@ -105,7 +197,7 @@ export class AppWebSocketGateway
             const connection = this.webSocketService.addConnection(client, user);
 
             // Notify client of successful connection
-            client.emit('user-connected', {
+            client.emit('user_connected', {
                 success: true,
                 data: {
                     socketId: client.id,
@@ -116,7 +208,7 @@ export class AppWebSocketGateway
             });
 
             // Broadcast to other clients that a user connected (optional)
-            client.broadcast.emit('user-connected', {
+            client.broadcast.emit('user_connected', {
                 success: true,
                 data: { user: connection.user },
                 timestamp: new Date().toISOString(),
@@ -126,9 +218,12 @@ export class AppWebSocketGateway
 
         } catch (error) {
             this.logger.error(`Connection error for client ${client.id}:`, error.message);
-            client.emit('error', {
+            client.emit('connection_error', {
                 success: false,
-                error: { message: 'Connection failed' },
+                error: { 
+                    message: 'Connection failed',
+                    code: 'CONNECTION_FAILED'
+                },
                 timestamp: new Date().toISOString(),
             });
             client.disconnect();
@@ -136,22 +231,93 @@ export class AppWebSocketGateway
     }
 
     handleDisconnect(client: Socket) {
-        const connection = this.webSocketService.getConnection(client.id);
+        try {
+            const connection = this.webSocketService.getConnection(client.id);
 
-        if (connection) {
-            this.logger.log(`Client disconnecting: ${client.id} (User: ${connection.user.email})`);
+            if (connection) {
+                this.logger.log(`Client disconnecting: ${client.id} (User: ${connection.user.email})`);
 
-            // Notify other clients that user disconnected
-            client.broadcast.emit('user-disconnected', {
-                success: true,
-                data: { userId: connection.userId },
-                timestamp: new Date().toISOString(),
+                // Notify other clients that user disconnected
+                client.broadcast.emit('user_disconnected', {
+                    success: true,
+                    data: { userId: connection.userId },
+                    timestamp: new Date().toISOString(),
+                });
+            } else {
+                this.logger.log(`Client disconnecting: ${client.id} (Unknown user)`);
+            }
+
+            this.webSocketService.removeConnection(client.id);
+            
+            // Clean up rate limiting data
+            this.rateLimitMap.delete(client.id);
+            
+        } catch (error) {
+            this.logger.error(`Error handling disconnect for client ${client.id}:`, error);
+        }
+    }
+
+    // ===========================================
+    // RATE LIMITING
+    // ===========================================
+
+    private checkRateLimit(clientId: string): boolean {
+        const now = Date.now();
+        const clientRateLimit = this.rateLimitMap.get(clientId);
+
+        if (!clientRateLimit || now > clientRateLimit.resetTime) {
+            // Reset or create new rate limit info
+            this.rateLimitMap.set(clientId, {
+                requests: 1,
+                resetTime: now + this.rateLimitConfig.windowMs,
             });
-        } else {
-            this.logger.log(`Client disconnecting: ${client.id} (Unknown user)`);
+            return true;
         }
 
-        this.webSocketService.removeConnection(client.id);
+        if (clientRateLimit.requests >= this.rateLimitConfig.maxRequests) {
+            return false;
+        }
+
+        clientRateLimit.requests++;
+        return true;
+    }
+
+    // ===========================================
+    // VALIDATION METHODS
+    // ===========================================
+
+    private validateTestMessageData(data: any): boolean {
+        // Basic validation - can be extended based on requirements
+        return data !== null && data !== undefined;
+    }
+
+    // ===========================================
+    // HEARTBEAT AND CLEANUP
+    // ===========================================
+
+    private startHeartbeat(): void {
+        setInterval(() => {
+            try {
+                const connections = this.webSocketService.getAllConnections();
+                this.logger.debug(`Sending heartbeat to ${connections.length} connections`);
+                
+                connections.forEach(connection => {
+                    this.webSocketService.ping(connection.id);
+                });
+            } catch (error) {
+                this.logger.error('Error during heartbeat:', error);
+            }
+        }, 30000); // Every 30 seconds
+    }
+
+    private startOrphanedConnectionCleanup(): void {
+        setInterval(() => {
+            try {
+                this.webSocketService.cleanupOrphanedConnections();
+            } catch (error) {
+                this.logger.error('Error during orphaned connection cleanup:', error);
+            }
+        }, 60000); // Every minute
     }
 
     // ===========================================
@@ -159,24 +325,29 @@ export class AppWebSocketGateway
     // ===========================================
 
     private extractTokenFromHandshake(client: Socket): string | null {
-        // Try different token locations
-        if (client.handshake.auth?.token) {
-            return client.handshake.auth.token;
-        }
+        try {
+            // Try different token locations
+            if (client.handshake.auth?.token) {
+                return client.handshake.auth.token;
+            }
 
-        if (client.handshake.headers?.authorization) {
-            const authHeader = client.handshake.headers.authorization;
-            const match = authHeader.match(/^Bearer\s+(.*)$/);
-            return match ? match[1] : null;
-        }
+            if (client.handshake.headers?.authorization) {
+                const authHeader = client.handshake.headers.authorization;
+                const match = authHeader.match(/^Bearer\s+(.*)$/);
+                return match ? match[1] : null;
+            }
 
-        if (client.handshake.query?.token) {
-            return Array.isArray(client.handshake.query.token)
-                ? client.handshake.query.token[0]
-                : client.handshake.query.token;
-        }
+            if (client.handshake.query?.token) {
+                return Array.isArray(client.handshake.query.token)
+                    ? client.handshake.query.token[0]
+                    : client.handshake.query.token;
+            }
 
-        return null;
+            return null;
+        } catch (error) {
+            this.logger.error('Error extracting token from handshake:', error);
+            return null;
+        }
     }
 
     private async validateToken(token: string): Promise<WebSocketUser | null> {
@@ -202,44 +373,39 @@ export class AppWebSocketGateway
             });
 
             if (!user) {
-                throw new Error('User not found');
+                this.logger.warn(`User not found for token: ${payload.sub}`);
+                return null;
             }
 
-            return {
-                id: user.id,
-                email: user.email,
-                name: user.name,
-                role: user.role.toString(),
-            };
+            this.logger.log(`Token validated successfully for user: ${user.email}`);
+            return user;
+
         } catch (error) {
-            this.logger.warn(`Token validation failed: ${error.message}`);
-            this.logger.warn(`Error details:`);
-            this.logger.warn(error);
+            this.logger.error('Token validation error:', error.message);
             return null;
         }
     }
 
-    // Enhanced connection handling with reconnection support
     private async handleReconnection(client: Socket, user: WebSocketUser) {
-        // Check if user has an existing connection
-        const existingConnection = this.webSocketService.getConnectionByUserId(user.id);
+        try {
+            const existingConnection = this.webSocketService.getConnectionByUserId(user.id);
 
-        if (existingConnection) {
-            this.logger.log(`User ${user.email} reconnecting, removing old connection ${existingConnection.id}`);
-
-            // Remove old connection
-            this.webSocketService.removeConnection(existingConnection.id);
-
-            // Notify about reconnection
-            client.emit('reconnected', {
-                success: true,
-                data: {
-                    message: 'Successfully reconnected',
-                    previousSocketId: existingConnection.id,
-                    newSocketId: client.id,
-                },
-                timestamp: new Date().toISOString(),
-            });
+            if (existingConnection) {
+                this.logger.log(`User ${user.email} reconnecting. Removing old connection: ${existingConnection.id}`);
+                
+                // Remove old connection
+                this.webSocketService.removeConnection(existingConnection.id);
+                
+                // Rejoin all voting rooms for the user
+                const userVotingRooms = this.webSocketService.getUserVotingRooms(user.id);
+                for (const votingId of userVotingRooms) {
+                    this.webSocketService.joinVotingRoom(client.id, votingId);
+                }
+                
+                this.logger.log(`User ${user.email} reconnected and rejoined ${userVotingRooms.length} voting rooms`);
+            }
+        } catch (error) {
+            this.logger.error(`Error handling reconnection for user ${user.email}:`, error);
         }
     }
 }

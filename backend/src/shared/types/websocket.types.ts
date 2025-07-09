@@ -18,8 +18,8 @@ export interface WebSocketEventMap {
   // Connection events
   'connect': () => void;
   'disconnect': () => void;
-  'user-connected': (user: WebSocketUser) => void;
-  'user-disconnected': (userId: string) => void;
+  'user_connected': (user: WebSocketUser) => void;
+  'user_disconnected': (userId: string) => void;
   
   // Basic ping/pong for health check
   'ping': () => void;
@@ -27,7 +27,11 @@ export interface WebSocketEventMap {
   
   // Error events
   'error': (error: { message: string; code?: string }) => void;
-  'auth-error': (error: { message: string }) => void;
+  'auth_error': (error: { message: string; code?: string }) => void;
+  'connection_error': (error: { message: string; code?: string }) => void;
+  'rate_limit_error': (error: { message: string; code?: string }) => void;
+  'validation_error': (error: { message: string; code?: string }) => void;
+  'voting_error': (error: { message: string; code?: string }) => void;
 }
 
 // Connection status
@@ -47,6 +51,25 @@ export interface WebSocketResponse<T = any> {
     code?: string;
   };
   timestamp: string;
+}
+
+// Rate limiting types
+export interface RateLimitConfig {
+  maxRequests: number;
+  windowMs: number;
+}
+
+export interface RateLimitInfo {
+  requests: number;
+  resetTime: number;
+}
+
+// Connection health monitoring
+export interface ConnectionHealth {
+  lastPing: Date;
+  lastPong: Date | null;
+  missedPings: number;
+  isAlive: boolean;
 }
 
 // Voting WebSocket Events
@@ -185,4 +208,30 @@ export interface WebSocketConfig {
     credentials: boolean;
   };
   transports: string[];
+}
+
+// Structured logging types
+export interface WebSocketLogEvent {
+  event: string;
+  timestamp: string;
+  data: any;
+}
+
+// Connection statistics
+export interface ConnectionStats {
+  totalConnections: number;
+  connectedUsers: number;
+  healthyConnections: number;
+  connections: ConnectionDetail[];
+}
+
+export interface ConnectionDetail {
+  socketId: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  connectedAt: Date;
+  duration: number;
+  isAlive: boolean;
+  missedPings: number;
 }

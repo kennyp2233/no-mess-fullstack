@@ -18,6 +18,9 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
+    "test:websocket": "jest --config ./test/websocket/jest-websocket.config.js",
+    "test:websocket:watch": "jest --config ./test/websocket/jest-websocket.config.js --watch",
+    "test:websocket:cov": "jest --config ./test/websocket/jest-websocket.config.js --coverage",
     "seed": "ts-node prisma/seed.ts"
   },
   "prisma": {

@@ -8,12 +8,20 @@ import {
     VotingRoomStats
 } from '../types/websocket.types';
 
+interface ConnectionHealth {
+    lastPing: Date;
+    lastPong: Date | null;
+    missedPings: number;
+    isAlive: boolean;
+}
+
 @Injectable()
 export class WebSocketService {
     private readonly logger = new Logger(WebSocketService.name);
     private server: Server;
     private connections = new Map<string, WebSocketConnection>();
     private votingRooms = new Map<string, VotingRoom>(); // votingId -> VotingRoom
+    private connectionHealth = new Map<string, ConnectionHealth>();
 
     setServer(server: Server) {
         this.server = server;
@@ -29,7 +37,22 @@ export class WebSocketService {
         };
 
         this.connections.set(socket.id, connection);
+        
+        // Initialize health tracking
+        this.connectionHealth.set(socket.id, {
+            lastPing: new Date(),
+            lastPong: null,
+            missedPings: 0,
+            isAlive: true,
+        });
+
         this.logger.log(`User ${user.email} connected with socket ${socket.id}`);
+        this.logStructuredEvent('connection_added', {
+            socketId: socket.id,
+            userId: user.id,
+            userEmail: user.email,
+            timestamp: new Date().toISOString(),
+        });
 
         return connection;
     }
@@ -42,6 +65,14 @@ export class WebSocketService {
 
             this.logger.log(`User ${connection.user.email} disconnected from socket ${socketId}`);
             this.connections.delete(socketId);
+            this.connectionHealth.delete(socketId);
+            
+            this.logStructuredEvent('connection_removed', {
+                socketId,
+                userId: connection.userId,
+                userEmail: connection.user.email,
+                timestamp: new Date().toISOString(),
+            });
         }
     }
 
@@ -70,167 +101,351 @@ export class WebSocketService {
         return this.getConnectionByUserId(userId) !== undefined;
     }
 
-    // Basic messaging utilities
+    // ===========================================
+    // HEALTH MONITORING AND CLEANUP
+    // ===========================================
+
+    cleanupOrphanedConnections(): void {
+        try {
+            const now = new Date();
+            const orphanedConnections: string[] = [];
+
+            for (const [socketId, health] of this.connectionHealth.entries()) {
+                const connection = this.connections.get(socketId);
+                if (!connection) {
+                    // Connection exists in health map but not in connections map
+                    this.connectionHealth.delete(socketId);
+                    continue;
+                }
+
+                // Check if connection is stale (no activity for 5 minutes)
+                const timeSinceLastActivity = now.getTime() - health.lastPing.getTime();
+                const isStale = timeSinceLastActivity > 300000; // 5 minutes
+
+                // Check if too many pings were missed
+                const isUnresponsive = health.missedPings >= 3;
+
+                if (isStale || isUnresponsive) {
+                    orphanedConnections.push(socketId);
+                    this.logger.warn(`Marking connection ${socketId} as orphaned. Stale: ${isStale}, Unresponsive: ${isUnresponsive}`);
+                }
+            }
+
+            // Remove orphaned connections
+            orphanedConnections.forEach(socketId => {
+                this.removeConnection(socketId);
+                this.logger.log(`Cleaned up orphaned connection: ${socketId}`);
+            });
+
+            if (orphanedConnections.length > 0) {
+                this.logStructuredEvent('orphaned_connections_cleaned', {
+                    count: orphanedConnections.length,
+                    socketIds: orphanedConnections,
+                    timestamp: new Date().toISOString(),
+                });
+            }
+
+        } catch (error) {
+            this.logger.error('Error during orphaned connection cleanup:', error);
+        }
+    }
+
+    // ===========================================
+    // HEARTBEAT MANAGEMENT
+    // ===========================================
+
+    ping(socketId: string): void {
+        try {
+            const health = this.connectionHealth.get(socketId);
+            if (health) {
+                health.lastPing = new Date();
+                health.missedPings++;
+                
+                // Mark as potentially dead if too many pings missed
+                if (health.missedPings >= 3) {
+                    health.isAlive = false;
+                }
+            }
+
+            this.sendToSocket(socketId, 'ping', { timestamp: new Date().toISOString() });
+        } catch (error) {
+            this.logger.error(`Error sending ping to ${socketId}:`, error);
+        }
+    }
+
+    handlePong(socketId: string): void {
+        try {
+            const health = this.connectionHealth.get(socketId);
+            if (health) {
+                health.lastPong = new Date();
+                health.missedPings = 0;
+                health.isAlive = true;
+            }
+        } catch (error) {
+            this.logger.error(`Error handling pong from ${socketId}:`, error);
+        }
+    }
+
+    // ===========================================
+    // RECONNECTION SUPPORT
+    // ===========================================
+
+    async handleUserReconnection(newSocketId: string, userId: string): Promise<boolean> {
+        try {
+            const connection = this.getConnection(newSocketId);
+            if (!connection) {
+                this.logger.warn(`Cannot handle reconnection: socket ${newSocketId} not found`);
+                return false;
+            }
+
+            // Get user's previous voting rooms
+            const userVotingRooms = this.getUserVotingRooms(userId);
+            
+            // Rejoin all rooms
+            for (const votingId of userVotingRooms) {
+                this.joinVotingRoom(newSocketId, votingId);
+            }
+
+            this.logStructuredEvent('user_reconnected', {
+                socketId: newSocketId,
+                userId,
+                rejoinedRooms: userVotingRooms,
+                timestamp: new Date().toISOString(),
+            });
+
+            this.logger.log(`User ${connection.user.email} reconnected and rejoined ${userVotingRooms.length} voting rooms`);
+            return true;
+
+        } catch (error) {
+            this.logger.error(`Error handling reconnection for user ${userId}:`, error);
+            return false;
+        }
+    }
+
+    // ===========================================
+    // BASIC MESSAGING UTILITIES
+    // ===========================================
+
     sendToSocket(socketId: string, event: string, data: any): void {
-        if (this.server) {
-            this.server.to(socketId).emit(event, this.createResponse(true, data));
+        try {
+            if (this.server) {
+                this.server.to(socketId).emit(event, this.createResponse(true, data));
+            }
+        } catch (error) {
+            this.logger.error(`Error sending to socket ${socketId}:`, error);
         }
     }
 
     sendToUser(userId: string, event: string, data: any): boolean {
-        const connection = this.getConnectionByUserId(userId);
-        if (connection) {
-            this.sendToSocket(connection.id, event, data);
-            return true;
+        try {
+            const connection = this.getConnectionByUserId(userId);
+            if (connection) {
+                this.sendToSocket(connection.id, event, data);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            this.logger.error(`Error sending to user ${userId}:`, error);
+            return false;
         }
-        return false;
     }
 
     broadcast(event: string, data: any, excludeSocketId?: string): void {
-        if (this.server) {
-            const emitter = excludeSocketId
-                ? this.server.except(excludeSocketId)
-                : this.server;
+        try {
+            if (this.server) {
+                const emitter = excludeSocketId
+                    ? this.server.except(excludeSocketId)
+                    : this.server;
 
-            emitter.emit(event, this.createResponse(true, data));
+                emitter.emit(event, this.createResponse(true, data));
+            }
+        } catch (error) {
+            this.logger.error('Error broadcasting message:', error);
         }
     }
 
-    // Error handling
+    // ===========================================
+    // ERROR HANDLING
+    // ===========================================
+
     sendError(socketId: string, error: { message: string; code?: string }): void {
-        this.sendToSocket(socketId, 'error', null);
-        if (this.server) {
-            this.server.to(socketId).emit('error', this.createResponse(false, null, error));
+        try {
+            if (this.server) {
+                this.server.to(socketId).emit('error', this.createResponse(false, null, error));
+            }
+        } catch (error) {
+            this.logger.error(`Error sending error to socket ${socketId}:`, error);
         }
     }
 
-    // Health check
-    ping(socketId: string): void {
-        this.sendToSocket(socketId, 'ping', { timestamp: new Date().toISOString() });
-    }
+    // ===========================================
+    // CONNECTION STATISTICS
+    // ===========================================
 
-    // Connection statistics
     getConnectionStats() {
-        return {
-            totalConnections: this.connections.size,
-            connectedUsers: this.getConnectedUserIds().length,
-            connections: this.getAllConnections().map(conn => ({
-                socketId: conn.id,
-                userId: conn.userId,
-                userEmail: conn.user.email,
-                userName: conn.user.name,
-                connectedAt: conn.connectedAt,
-                duration: Date.now() - conn.connectedAt.getTime(),
-            })),
-        };
+        try {
+            const now = new Date();
+            const connections = this.getAllConnections();
+            
+            return {
+                totalConnections: this.connections.size,
+                connectedUsers: this.getConnectedUserIds().length,
+                healthyConnections: Array.from(this.connectionHealth.values()).filter(h => h.isAlive).length,
+                connections: connections.map(conn => {
+                    const health = this.connectionHealth.get(conn.id);
+                    return {
+                        socketId: conn.id,
+                        userId: conn.userId,
+                        userEmail: conn.user.email,
+                        userName: conn.user.name,
+                        connectedAt: conn.connectedAt,
+                        duration: now.getTime() - conn.connectedAt.getTime(),
+                        isAlive: health?.isAlive ?? false,
+                        missedPings: health?.missedPings ?? 0,
+                    };
+                }),
+            };
+        } catch (error) {
+            this.logger.error('Error getting connection stats:', error);
+            return {
+                totalConnections: 0,
+                connectedUsers: 0,
+                healthyConnections: 0,
+                connections: [],
+            };
+        }
     }
 
-    // Voting Room Management
+    // ===========================================
+    // VOTING ROOM MANAGEMENT
+    // ===========================================
+
     joinVotingRoom(socketId: string, votingId: string): boolean {
-        const connection = this.getConnection(socketId);
-        if (!connection) {
-            this.logger.warn(`Cannot join voting room: socket ${socketId} not found`);
+        try {
+            const connection = this.getConnection(socketId);
+            if (!connection) {
+                this.logger.warn(`Cannot join voting room: socket ${socketId} not found`);
+                return false;
+            }
+
+            // Get or create voting room
+            let room = this.votingRooms.get(votingId);
+            if (!room) {
+                room = {
+                    votingId,
+                    participants: new Set<string>(),
+                    userIds: new Set<string>(),
+                    createdAt: new Date(),
+                    lastActivity: new Date(),
+                };
+                this.votingRooms.set(votingId, room);
+                this.logger.log(`Created new voting room: ${votingId}`);
+            }
+
+            // Add participant to room
+            room.participants.add(socketId);
+            room.userIds.add(connection.userId);
+            room.lastActivity = new Date();
+
+            // Join Socket.IO room
+            if (this.server) {
+                const socket = this.server.sockets.sockets.get(socketId);
+                if (socket) {
+                    socket.join(`voting:${votingId}`);
+                    this.logger.log(`User ${connection.user.email} joined voting room ${votingId}`);
+                    
+                    this.logStructuredEvent('voting_room_joined', {
+                        socketId,
+                        userId: connection.userId,
+                        votingId,
+                        timestamp: new Date().toISOString(),
+                    });
+                    
+                    return true;
+                }
+            }
+
+            return false;
+        } catch (error) {
+            this.logger.error(`Error joining voting room ${votingId} for socket ${socketId}:`, error);
             return false;
         }
-
-        // Get or create voting room
-        let room = this.votingRooms.get(votingId);
-        if (!room) {
-            room = {
-                votingId,
-                participants: new Set<string>(),
-                userIds: new Set<string>(),
-                createdAt: new Date(),
-                lastActivity: new Date(),
-            };
-            this.votingRooms.set(votingId, room);
-            this.logger.log(`Created new voting room: ${votingId}`);
-        }
-
-        // Add participant to room
-        room.participants.add(socketId);
-        room.userIds.add(connection.userId);
-        room.lastActivity = new Date();
-
-        // Join Socket.IO room
-        if (this.server) {
-            const socket = this.server.sockets.sockets.get(socketId);
-            if (socket) {
-                socket.join(`voting:${votingId}`);
-                this.logger.log(`User ${connection.user.email} joined voting room ${votingId}`);
-                return true;
-            }
-        }
-
-        return false;
     }
 
     leaveVotingRoom(socketId: string, votingId: string): boolean {
-        const connection = this.getConnection(socketId);
-        if (!connection) {
-            return false;
-        }
-
-        const room = this.votingRooms.get(votingId);
-        if (!room) {
-            return false;
-        }
-
-        // Remove participant from room
-        room.participants.delete(socketId);
-        room.userIds.delete(connection.userId);
-        room.lastActivity = new Date();
-
-        // Leave Socket.IO room
-        if (this.server) {
-            const socket = this.server.sockets.sockets.get(socketId);
-            if (socket) {
-                socket.leave(`voting:${votingId}`);
-                this.logger.log(`User ${connection.user.email} left voting room ${votingId}`);
+        try {
+            const connection = this.getConnection(socketId);
+            if (!connection) {
+                return false;
             }
-        }
 
-        // Clean up empty room
-        if (room.participants.size === 0) {
-            this.votingRooms.delete(votingId);
-            this.logger.log(`Deleted empty voting room: ${votingId}`);
-        }
+            const room = this.votingRooms.get(votingId);
+            if (!room) {
+                return false;
+            }
 
-        return true;
+            // Remove participant from room
+            room.participants.delete(socketId);
+            room.userIds.delete(connection.userId);
+            room.lastActivity = new Date();
+
+            // Leave Socket.IO room
+            if (this.server) {
+                const socket = this.server.sockets.sockets.get(socketId);
+                if (socket) {
+                    socket.leave(`voting:${votingId}`);
+                    this.logger.log(`User ${connection.user.email} left voting room ${votingId}`);
+                    
+                    this.logStructuredEvent('voting_room_left', {
+                        socketId,
+                        userId: connection.userId,
+                        votingId,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            }
+
+            // Clean up empty room
+            if (room.participants.size === 0) {
+                this.votingRooms.delete(votingId);
+                this.logger.log(`Deleted empty voting room: ${votingId}`);
+            }
+
+            return true;
+        } catch (error) {
+            this.logger.error(`Error leaving voting room ${votingId} for socket ${socketId}:`, error);
+            return false;
+        }
     }
 
     leaveAllVotingRooms(socketId: string): void {
-        const connection = this.getConnection(socketId);
-        if (!connection) {
-            return;
-        }
+        try {
+            const roomsToLeave = Array.from(this.votingRooms.keys()).filter(votingId => {
+                const room = this.votingRooms.get(votingId);
+                return room?.participants.has(socketId) ?? false;
+            });
 
-        // Find all rooms this socket is in and leave them
-        for (const [votingId, room] of this.votingRooms.entries()) {
-            if (room.participants.has(socketId)) {
+            roomsToLeave.forEach(votingId => {
                 this.leaveVotingRoom(socketId, votingId);
-            }
+            });
+        } catch (error) {
+            this.logger.error(`Error leaving all voting rooms for socket ${socketId}:`, error);
         }
     }
 
     broadcastToVotingRoom(votingId: string, event: string, data: any, excludeSocketId?: string): void {
-        if (!this.server) {
-            return;
+        try {
+            if (this.server) {
+                const roomName = `voting:${votingId}`;
+                const emitter = excludeSocketId
+                    ? this.server.to(roomName).except(excludeSocketId)
+                    : this.server.to(roomName);
+
+                emitter.emit(event, this.createResponse(true, data));
+            }
+        } catch (error) {
+            this.logger.error(`Error broadcasting to voting room ${votingId}:`, error);
         }
-
-        const roomName = `voting:${votingId}`;
-        const emitter = excludeSocketId
-            ? this.server.to(roomName).except(excludeSocketId)
-            : this.server.to(roomName);
-
-        emitter.emit(event, this.createResponse(true, data));
-
-        const room = this.votingRooms.get(votingId);
-        if (room) {
-            room.lastActivity = new Date();
-        }
-
-        this.logger.log(`Broadcasted ${event} to voting room ${votingId}`);
     }
 
     getVotingRoom(votingId: string): VotingRoom | undefined {
@@ -238,42 +453,70 @@ export class WebSocketService {
     }
 
     getVotingRoomStats(votingId: string): VotingRoomStats | undefined {
-        const room = this.votingRooms.get(votingId);
-        if (!room) {
+        try {
+            const room = this.votingRooms.get(votingId);
+            if (!room) return undefined;
+
+            return {
+                votingId,
+                participantsCount: room.participants.size,
+                activeUsers: Array.from(room.userIds),
+                lastActivity: room.lastActivity,
+            };
+        } catch (error) {
+            this.logger.error(`Error getting voting room stats for ${votingId}:`, error);
             return undefined;
         }
-
-        return {
-            votingId,
-            participantsCount: room.participants.size,
-            activeUsers: Array.from(room.userIds),
-            lastActivity: room.lastActivity,
-        };
     }
 
     getAllVotingRooms(): VotingRoomStats[] {
-        return Array.from(this.votingRooms.values()).map(room => ({
-            votingId: room.votingId,
-            participantsCount: room.participants.size,
-            activeUsers: Array.from(room.userIds),
-            lastActivity: room.lastActivity,
-        }));
+        try {
+            return Array.from(this.votingRooms.keys()).map(votingId => {
+                const stats = this.getVotingRoomStats(votingId);
+                return stats!;
+            }).filter(Boolean);
+        } catch (error) {
+            this.logger.error('Error getting all voting rooms:', error);
+            return [];
+        }
     }
 
     isUserInVotingRoom(userId: string, votingId: string): boolean {
-        const room = this.votingRooms.get(votingId);
-        return room ? room.userIds.has(userId) : false;
+        try {
+            const room = this.votingRooms.get(votingId);
+            return room?.userIds.has(userId) ?? false;
+        } catch (error) {
+            this.logger.error(`Error checking if user ${userId} is in voting room ${votingId}:`, error);
+            return false;
+        }
     }
 
     getUserVotingRooms(userId: string): string[] {
-        const votingIds: string[] = [];
-        for (const [votingId, room] of this.votingRooms.entries()) {
-            if (room.userIds.has(userId)) {
-                votingIds.push(votingId);
-            }
+        try {
+            return Array.from(this.votingRooms.keys()).filter(votingId => {
+                return this.isUserInVotingRoom(userId, votingId);
+            });
+        } catch (error) {
+            this.logger.error(`Error getting voting rooms for user ${userId}:`, error);
+            return [];
         }
-        return votingIds;
     }
+
+    // ===========================================
+    // STRUCTURED LOGGING
+    // ===========================================
+
+    private logStructuredEvent(event: string, data: any): void {
+        this.logger.log(JSON.stringify({
+            event,
+            timestamp: new Date().toISOString(),
+            data,
+        }));
+    }
+
+    // ===========================================
+    // PRIVATE HELPER METHODS
+    // ===========================================
 
     private createResponse<T>(
         success: boolean,
